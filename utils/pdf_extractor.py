@@ -1,92 +1,189 @@
 import pdfplumber
 import re
 import pandas as pd
+import logging
+import traceback
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def extract_attendance_data(pdf_file):
-    """Extract attendance data from PDF file"""
-    with pdfplumber.open(pdf_file) as pdf:
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text()
+    """
+    Extract attendance data from PDF file with improved error handling and
+    support for different PDF formats.
     
-    # Extract student info
-    student_name_match = re.search(r'Self Attendance Report\s*:\s*([^(]+)', text)
-    student_name = student_name_match.group(1).strip() if student_name_match else "Unknown"
-    
-    # Extract attendance data
-    lines = text.split('\n')
-    data = []
-    
-    # Find the start of the attendance table
-    for i, line in enumerate(lines):
-        if re.search(r'SrNo\s+Subject\s+Subject\s+Type\s+Present\s+Total', line):
-            start_idx = i + 1
-            break
-    else:
-        start_idx = 0
-    
-    # Extract subject rows until summary rows
-    for i in range(start_idx, len(lines)):
-        line = lines[i].strip()
-        # Skip empty lines
-        if not line:
-            continue
-            
-        # Stop at summary rows (which typically start with "Theory", "Practical", etc.)
-        if any(line.startswith(word) for word in ["Theory", "Practical", "Tutorial", "Total", "Note"]):
-            break
-            
-        # Try to extract subject data
-        # Pattern: number, subject name, type (TH/PR/TU), present, total, percentage
-        parts = re.split(r'\s{2,}', line)
+    Args:
+        pdf_file: A file-like object containing the PDF
         
-        if len(parts) >= 5:  # Need at least 5 parts for a valid row
+    Returns:
+        dict: Dictionary with student_name, subjects list, and overall attendance
+    """
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            text = ""
+            for page in pdf.pages:
+                extracted_text = page.extract_text()
+                if extracted_text:
+                    text += extracted_text + "\n"
+                    
+        if not text.strip():
+            logger.warning("No text could be extracted from the PDF")
+            return _get_empty_result()
+            
+        # Extract student info with more flexible pattern matching
+        student_name_patterns = [
+            r'Self Attendance Report\s*:\s*([^(]+)',  # Common format
+            r'Student\s*Name\s*:\s*([^(]+)',          # Alternative format
+            r'Name\s*:\s*([^(]+)',                   # Simpler format
+        ]
+        
+        student_name = "Unknown"
+        for pattern in student_name_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                student_name = match.group(1).strip()
+                break
+                
+        # Extract attendance data with improved pattern matching
+        lines = text.split('\n')
+        data = []
+        
+        # Find the start of the attendance table with more flexible pattern matching
+        start_patterns = [
+            r'SrNo\s+Subject\s+Subject\s+Type\s+Present\s+Total',  # Common format
+            r'Sr\.?\s*No\.?\s+Subject\s+.*Present\s+Total',        # Alternative format
+            r'Subject\s+Type\s+Present\s+Total',                   # Simpler format
+        ]
+        
+        start_idx = 0
+        for pattern in start_patterns:
+            for i, line in enumerate(lines):
+                if re.search(pattern, line, re.IGNORECASE):
+                    start_idx = i + 1
+                    break
+            if start_idx > 0:
+                break
+                
+        # Extract subject rows using improved regex patterns
+        for i in range(start_idx, len(lines)):
+            line = lines[i].strip()
+            # Skip empty lines
+            if not line:
+                continue
+                
+            # Stop at summary rows
+            if any(re.match(r'^\s*(theory|practical|tutorial|total|note)\s*', line, re.IGNORECASE) for word in ["Theory", "Practical", "Tutorial", "Total", "Note"]):
+                break
+                
+            # Try multiple patterns to extract subject data
             try:
-                # Sometimes subject name and type are merged, so we need to split them
-                subject_parts = []
-                subject_type = ""
+                # First try splitting by multiple spaces
+                parts = re.split(r'\s{2,}', line)
                 
-                for part in parts[1:-3]:  # Skip first (serial) and last 3 (present, total, percentage)
-                    if part in ["TH", "PR", "TU", "ESH"]:
-                        subject_type = part
-                    else:
-                        subject_parts.append(part)
+                # If that doesn't work well, try a more structured approach
+                if len(parts) < 4:
+                    # Look for patterns like: [number] [subject] [type] [present] [total] [percentage]
+                    match = re.search(r'^\s*\d+\s+(.+?)\s+(TH|PR|TU|ESH)\s+(\d+)\s+(\d+)\s+([\d.]+)', line)
+                    if match:
+                        subject_name = match.group(1).strip()
+                        subject_type = match.group(2).strip()
+                        present = int(match.group(3))
+                        total = int(match.group(4))
+                        
+                        data.append({
+                            "Subject": subject_name,
+                            "Type": subject_type,
+                            "Present": present,
+                            "Total": total,
+                            "Percentage": round(present / total * 100, 2) if total > 0 else 0
+                        })
+                        continue
                 
-                subject_name = " ".join(subject_parts).strip()
+                # Process the parts from split by spaces method
+                if len(parts) >= 5:
+                    # Try to identify subject, type, present, total
+                    subject_parts = []
+                    subject_type = ""
+                    
+                    # Look for known subject types
+                    for part in parts:
+                        if re.match(r'^(TH|PR|TU|ESH)$', part.strip()):
+                            subject_type = part.strip()
+                            
+                    # If we found a type, everything before it is the subject name
+                    if subject_type:
+                        type_index = parts.index(subject_type)
+                        subject_parts = parts[1:type_index]  # Skip first part (serial number)
+                        subject_name = " ".join(subject_parts).strip()
+                        
+                        # The next parts should be present and total
+                        for j in range(type_index + 1, len(parts)):
+                            if parts[j].strip().isdigit():
+                                present = int(parts[j])
+                                if j + 1 < len(parts) and parts[j + 1].strip().isdigit():
+                                    total = int(parts[j + 1])
+                                    
+                                    data.append({
+                                        "Subject": subject_name,
+                                        "Type": subject_type,
+                                        "Present": present,
+                                        "Total": total,
+                                        "Percentage": round(present / total * 100, 2) if total > 0 else 0
+                                    })
+                                    break
+            except (ValueError, IndexError) as e:
+                logger.debug(f"Error parsing line: {line}, Error: {str(e)}")
+                # Skip invalid rows, but don't crash
+                continue
+        
+        # Extract overall attendance with more flexible pattern matching
+        overall_patterns = [
+            r'Total\s+(\d+)\s+(\d+)\s+([\d.]+)',  # Common format
+            r'Overall\s+(\d+)\s+(\d+)\s+([\d.]+)', # Alternative format
+        ]
+        
+        overall = None
+        for pattern in overall_patterns:
+            match = re.search(pattern, text)
+            if match:
+                overall = {
+                    "Present": int(match.group(1)),
+                    "Total": int(match.group(2)),
+                    "Percentage": float(match.group(3))
+                }
+                break
                 
-                # If we don't have a type yet, try to extract it from the data
-                if not subject_type and len(parts) > 3:
-                    type_match = re.search(r'\b(TH|PR|TU|ESH)\b', parts[-4])
-                    if type_match:
-                        subject_type = type_match.group(1)
-                
-                # Get present and total values
-                present = int(parts[-3])
-                total = int(parts[-2])
-                
-                # Only add if we have valid numbers
-                if present >= 0 and total > 0:
-                    data.append({
-                        "Subject": subject_name,
-                        "Type": subject_type,
-                        "Present": present,
-                        "Total": total,
-                        "Percentage": round(present / total * 100, 2)
-                    })
-            except (ValueError, IndexError):
-                # Skip invalid rows
-                pass
-    
-    # Extract overall attendance
-    overall_match = re.search(r'Total\s+(\d+)\s+(\d+)\s+([\d.]+)', text)
-    overall = {
-        "Present": int(overall_match.group(1)) if overall_match else sum(item["Present"] for item in data),
-        "Total": int(overall_match.group(2)) if overall_match else sum(item["Total"] for item in data),
-    }
-    overall["Percentage"] = round(overall["Present"] / overall["Total"] * 100, 2) if overall["Total"] > 0 else 0
-    
+        # If no overall data found, calculate from subjects
+        if not overall:
+            total_present = sum(item["Present"] for item in data) if data else 0
+            total_classes = sum(item["Total"] for item in data) if data else 0
+            overall = {
+                "Present": total_present,
+                "Total": total_classes,
+                "Percentage": round(total_present / total_classes * 100, 2) if total_classes > 0 else 0
+            }
+            
+        return {
+            "student_name": student_name,
+            "subjects": data,
+            "overall": overall
+        }
+        
+    except Exception as e:
+        logger.error(f"Error extracting attendance data: {str(e)}")
+        logger.debug(traceback.format_exc())
+        return _get_empty_result()
+        
+def _get_empty_result():
+    """Return an empty result structure when extraction fails"""
     return {
-        "student_name": student_name,
-        "subjects": data,
-        "overall": overall
+        "student_name": "Unknown",
+        "subjects": [],
+        "overall": {
+            "Present": 0,
+            "Total": 0,
+            "Percentage": 0
+        }
     }

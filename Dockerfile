@@ -2,13 +2,14 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install required system dependencies for PDF processing
+# Install required system dependencies for PDF processing and health check
 RUN apt-get update && apt-get install -y \
     build-essential \
     poppler-utils \
     libpoppler-cpp-dev \
     pkg-config \
     python3-dev \
+    curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
